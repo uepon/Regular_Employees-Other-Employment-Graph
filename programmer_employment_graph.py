@@ -7,10 +7,14 @@
 推移を可視化し、統計情報を出力します。
 
 【重要】
-デフォルトではサンプルデータ（架空データ）を使用します。
+プログラム内部にサンプルデータ（架空データ）が含まれており、
+CSVファイルを指定しない場合はこのサンプルデータが使用されます。
+
 実際の統計データを使用する場合は、以下のいずれかの方法でデータを提供してください：
 1. 'data_source.csv' ファイルを作成してプログラムと同じディレクトリに配置
 2. コマンドライン引数で CSVファイルのパスを指定: python3 programmer_employment_graph.py --input data.csv
+
+サンプルデータ使用時は実行時に警告が表示されます。
 """
 
 from dataclasses import dataclass
@@ -24,346 +28,388 @@ import matplotlib.pyplot as plt
 import matplotlib
 
 
-# ==================== 定数定義 ====================
+# ==================== 設定定数 ====================
 
 @dataclass(frozen=True)
 class Config:
-    """設定定数クラス"""
-    # グラフ設定
-    FIGURE_SIZE: Tuple[int, int] = (14, 8)
-    DPI: int = 300
-    Y_AXIS_MAX: int = 85
+    """
+    グラフ作成に必要な全設定を集約
 
-    # 色設定
-    COLOR_REGULAR: str = '#2E86AB'
-    COLOR_NON_REGULAR: str = '#E63946'
+    このクラスは変更不可（frozen=True）で、すべての設定値を一元管理します。
+    """
 
-    # 年次設定（サンプルデータ用）
-    START_YEAR: int = 2013
-    END_YEAR: int = 2024
-    RECENT_PERIOD_YEARS: int = 6  # 直近期間の年数
+    # グラフサイズと解像度
+    FIGURE_SIZE: Tuple[int, int] = (14, 8)  # インチ単位 (幅, 高さ)
+    DPI: int = 300  # 画像解像度（dots per inch）
+    Y_AXIS_MAXIMUM_VALUE: int = 85  # Y軸の最大値（万人）
 
-    # 出典情報
-    SOURCE_TEXT: str = (
+    # グラフの配色
+    COLOR_REGULAR_EMPLOYEE: str = '#2E86AB'  # 正社員の線の色（青系）
+    COLOR_NON_REGULAR_EMPLOYEE: str = '#E63946'  # 非正規雇用の線の色（赤系）
+
+    # サンプルデータの設定（実データ使用時は無視される）
+    SAMPLE_DATA_START_YEAR: int = 2013
+    SAMPLE_DATA_END_YEAR: int = 2024
+    RECENT_PERIOD_YEARS: int = 6  # 直近期間として扱う年数
+
+    # グラフに表示するデータ出典情報
+    DATA_SOURCE_TEXT: str = (
         '出典：総務省「労働力調査」、厚生労働省「賃金構造基本統計調査」、\n'
         '経済産業省「IT人材白書」、JISA「情報サービス産業基本統計調査」を基に推定\n'
         '※プログラマー職のみ（PM・SE除く）、元請・下請全階層を含む'
     )
 
-    # 列名
+    # CSV列名（実データCSVもこの列名に従う必要があります）
     COLUMN_YEAR: str = '年'
-    COLUMN_REGULAR: str = '正社員'
-    COLUMN_NON_REGULAR: str = '非正規雇用'
-    COLUMN_TOTAL: str = '合計'
-    COLUMN_RATIO: str = '非正規比率(%)'
+    COLUMN_REGULAR_EMPLOYEE: str = '正社員'
+    COLUMN_NON_REGULAR_EMPLOYEE: str = '非正規雇用'
+    COLUMN_TOTAL_EMPLOYEE: str = '合計'  # プログラムが自動計算
+    COLUMN_NON_REGULAR_RATIO: str = '非正規比率(%)'  # プログラムが自動計算
 
-    # 非正規雇用の内訳列名
-    DETAIL_COLUMNS: Tuple[str, ...] = (
+    # 非正規雇用の内訳列名（サンプルデータでのみ使用、実データでは任意）
+    NON_REGULAR_BREAKDOWN_COLUMNS: Tuple[str, ...] = (
         'フリーランス・高スキル業務委託',
         '契約社員（元請・2次請）',
         '派遣（3次請以下）',
         '低賃金契約（3次請以下）'
     )
 
-    # ファイル名
-    DEFAULT_INPUT_FILE: str = 'data_source.csv'
-    DEFAULT_OUTPUT_FILE: str = 'programmer_employment_pandas.png'
-    DEFAULT_CSV_OUTPUT: str = 'programmer_employment_data.csv'
+    # ファイル名の設定
+    DEFAULT_INPUT_FILENAME: str = 'data_source.csv'  # 自動検出する実データファイル名
+    DEFAULT_OUTPUT_GRAPH_FILENAME: str = 'programmer_employment_pandas.png'  # 出力グラフファイル名
+    DEFAULT_OUTPUT_CSV_FILENAME: str = 'programmer_employment_data.csv'  # 出力CSVファイル名
 
-    # 表示設定
-    SEPARATOR_LENGTH: int = 60
+    # 表示フォーマットの設定
+    SEPARATOR_LINE_LENGTH: int = 60  # コンソール出力の区切り線の長さ
     FONT_SIZE_TITLE: int = 15
-    FONT_SIZE_LABEL: int = 14
+    FONT_SIZE_AXIS_LABEL: int = 14
     FONT_SIZE_LEGEND: int = 12
-    FONT_SIZE_GROWTH_BOX: int = 13
-    FONT_SIZE_ANNOTATION: int = 11
-    FONT_SIZE_SOURCE: int = 9
+    FONT_SIZE_GROWTH_RATE_BOX: int = 13
+    FONT_SIZE_VALUE_ANNOTATION: int = 11
+    FONT_SIZE_DATA_SOURCE: int = 9
 
 
-# ==================== データ処理クラス ====================
+# ==================== データ処理 ====================
 
 class EmploymentDataProcessor:
-    """雇用データ処理クラス"""
+    """
+    雇用データの読み込み、生成、計算を担当するクラス
+
+    実データCSVの読み込み、サンプルデータの生成、
+    および計算列の追加などを行います。
+    """
 
     @staticmethod
-    def create_sample_data() -> Dict[str, List]:
+    def load_or_create_dataframe(csv_file_path: Optional[str] = None) -> pd.DataFrame:
         """
-        サンプルデータ（架空データ）を作成
+        CSVファイルから実データを読み込むか、サンプルデータを生成
 
-        【警告】これは実際の統計データではありません。
+        Args:
+            csv_file_path: CSVファイルパス。Noneの場合はサンプルデータを生成
 
         Returns:
-            dict: 年度別の雇用データ（サンプル）
+            pd.DataFrame: 雇用データ（計算列を含む）
         """
-        EmploymentDataProcessor._print_sample_data_warning()
-
-        return {
-            Config.COLUMN_YEAR: list(range(Config.START_YEAR, Config.END_YEAR + 1)),
-            Config.COLUMN_REGULAR: [38, 40, 42, 44, 46, 48, 50, 51, 53, 55, 57, 58],
-            Config.DETAIL_COLUMNS[0]: [8, 9, 10, 12, 14, 16, 18, 20, 22, 24, 27, 30],
-            Config.DETAIL_COLUMNS[1]: [10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 10],
-            Config.DETAIL_COLUMNS[2]: [8, 9, 10, 11, 13, 15, 17, 18, 20, 22, 24, 26],
-            Config.DETAIL_COLUMNS[3]: [4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 7, 8]
-        }
+        if csv_file_path:
+            return EmploymentDataProcessor._load_real_data_from_csv(csv_file_path)
+        return EmploymentDataProcessor._generate_sample_dataframe()
 
     @staticmethod
-    def _print_sample_data_warning() -> None:
-        """サンプルデータ使用の警告を表示"""
-        print("\n" + "=" * Config.SEPARATOR_LENGTH)
+    def _load_real_data_from_csv(csv_file_path: str) -> pd.DataFrame:
+        """
+        CSVファイルから実データを読み込み、必要な計算列を追加
+
+        Args:
+            csv_file_path: CSVファイルのパス
+
+        Returns:
+            pd.DataFrame: 実データ（計算列を含む）
+
+        Raises:
+            FileNotFoundError: ファイルが存在しない場合
+            ValueError: ファイル読み込み失敗または必須列が不足している場合
+        """
+        if not os.path.exists(csv_file_path):
+            raise FileNotFoundError(f"CSVファイルが見つかりません: {csv_file_path}")
+
+        try:
+            dataframe = pd.read_csv(csv_file_path, encoding='utf-8-sig')
+        except Exception as error:
+            raise ValueError(f"CSVファイルの読み込みに失敗しました: {error}")
+
+        # 必須列の存在確認
+        required_column_names = [
+            Config.COLUMN_YEAR,
+            Config.COLUMN_REGULAR_EMPLOYEE,
+            Config.COLUMN_NON_REGULAR_EMPLOYEE
+        ]
+        missing_column_names = [
+            col for col in required_column_names if col not in dataframe.columns
+        ]
+
+        if missing_column_names:
+            raise ValueError(f"必須列が不足しています: {', '.join(missing_column_names)}")
+
+        print(f"\n実データを読み込みました: {csv_file_path}")
+        print(f"データ期間: {int(dataframe[Config.COLUMN_YEAR].min())}年 - "
+              f"{int(dataframe[Config.COLUMN_YEAR].max())}年")
+        print(f"データ件数: {len(dataframe)}件\n")
+
+        return EmploymentDataProcessor._add_calculated_columns(dataframe)
+
+    @staticmethod
+    def _generate_sample_dataframe() -> pd.DataFrame:
+        """
+        サンプルデータ（架空データ）を生成してDataFrameとして返す
+
+        注意: これは実際の統計データではありません。
+        デモンストレーション用の架空データです。
+
+        Returns:
+            pd.DataFrame: サンプルデータ（計算列を含む）
+        """
+        EmploymentDataProcessor._display_sample_data_warning()
+
+        # サンプルデータの定義（架空の数値）
+        sample_data_dict = {
+            Config.COLUMN_YEAR: list(range(
+                Config.SAMPLE_DATA_START_YEAR,
+                Config.SAMPLE_DATA_END_YEAR + 1
+            )),
+            Config.COLUMN_REGULAR_EMPLOYEE: [38, 40, 42, 44, 46, 48, 50, 51, 53, 55, 57, 58],
+            Config.NON_REGULAR_BREAKDOWN_COLUMNS[0]: [8, 9, 10, 12, 14, 16, 18, 20, 22, 24, 27, 30],
+            Config.NON_REGULAR_BREAKDOWN_COLUMNS[1]: [10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 10],
+            Config.NON_REGULAR_BREAKDOWN_COLUMNS[2]: [8, 9, 10, 11, 13, 15, 17, 18, 20, 22, 24, 26],
+            Config.NON_REGULAR_BREAKDOWN_COLUMNS[3]: [4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 7, 8]
+        }
+
+        dataframe = pd.DataFrame(sample_data_dict)
+
+        # 非正規雇用の合計を計算
+        dataframe[Config.COLUMN_NON_REGULAR_EMPLOYEE] = dataframe[
+            list(Config.NON_REGULAR_BREAKDOWN_COLUMNS)
+        ].sum(axis=1)
+
+        return EmploymentDataProcessor._add_calculated_columns(dataframe)
+
+    @staticmethod
+    def _display_sample_data_warning() -> None:
+        """サンプルデータ使用時の警告メッセージをコンソールに表示"""
+        print("\n" + "=" * Config.SEPARATOR_LINE_LENGTH)
         print("【警告】サンプルデータ（架空データ）を使用しています")
         print("実際の統計データを使用する場合は、CSVファイルを提供してください")
         print("詳細は --help オプションで確認できます")
-        print("=" * Config.SEPARATOR_LENGTH + "\n")
+        print("=" * Config.SEPARATOR_LINE_LENGTH + "\n")
 
     @staticmethod
-    def load_from_csv(csv_path: str) -> pd.DataFrame:
+    def _add_calculated_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
         """
-        CSVファイルから実データを読み込む
-
-        CSVフォーマット:
-        - 必須列: '年', '正社員', '非正規雇用'
-        - オプション列: 非正規雇用の内訳
+        合計と比率の計算列を追加（まだ存在しない場合のみ）
 
         Args:
-            csv_path: CSVファイルのパス
+            dataframe: 元のデータフレーム
 
         Returns:
-            pd.DataFrame: 読み込んだデータ
-
-        Raises:
-            FileNotFoundError: ファイルが見つからない場合
-            ValueError: 必須列が不足している場合
+            pd.DataFrame: 計算列が追加されたデータフレーム
         """
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"CSVファイルが見つかりません: {csv_path}")
+        if Config.COLUMN_TOTAL_EMPLOYEE not in dataframe.columns:
+            dataframe[Config.COLUMN_TOTAL_EMPLOYEE] = (
+                dataframe[Config.COLUMN_REGULAR_EMPLOYEE] +
+                dataframe[Config.COLUMN_NON_REGULAR_EMPLOYEE]
+            )
 
-        try:
-            df = pd.read_csv(csv_path, encoding='utf-8-sig')
-        except Exception as e:
-            raise ValueError(f"CSVファイルの読み込みに失敗しました: {e}")
-
-        # 必須列の確認
-        required_columns = [Config.COLUMN_YEAR, Config.COLUMN_REGULAR, Config.COLUMN_NON_REGULAR]
-        missing_columns = [col for col in required_columns if col not in df.columns]
-
-        if missing_columns:
-            raise ValueError(f"必須列が不足しています: {', '.join(missing_columns)}")
-
-        print(f"\n実データを読み込みました: {csv_path}")
-        print(f"データ期間: {df[Config.COLUMN_YEAR].min()}年 - {df[Config.COLUMN_YEAR].max()}年")
-        print(f"データ件数: {len(df)}件\n")
-
-        return df
-
-    @staticmethod
-    def create_dataframe(csv_path: Optional[str] = None) -> pd.DataFrame:
-        """
-        雇用データのDataFrameを作成
-
-        Args:
-            csv_path: CSVファイルのパス（Noneの場合はサンプルデータを使用）
-
-        Returns:
-            pd.DataFrame: 計算済みの雇用データ
-        """
-        if csv_path:
-            df = EmploymentDataProcessor.load_from_csv(csv_path)
-            df = EmploymentDataProcessor._add_calculated_columns(df)
-        else:
-            df = EmploymentDataProcessor._create_sample_dataframe()
-
-        return df
-
-    @staticmethod
-    def _create_sample_dataframe() -> pd.DataFrame:
-        """サンプルデータからDataFrameを作成"""
-        data = EmploymentDataProcessor.create_sample_data()
-        df = pd.DataFrame(data)
-
-        # 非正規雇用の合計を計算
-        df[Config.COLUMN_NON_REGULAR] = df[list(Config.DETAIL_COLUMNS)].sum(axis=1)
-
-        df = EmploymentDataProcessor._add_calculated_columns(df)
-        return df
-
-    @staticmethod
-    def _add_calculated_columns(df: pd.DataFrame) -> pd.DataFrame:
-        """計算列を追加"""
-        if Config.COLUMN_TOTAL not in df.columns:
-            df[Config.COLUMN_TOTAL] = df[Config.COLUMN_REGULAR] + df[Config.COLUMN_NON_REGULAR]
-
-        if Config.COLUMN_RATIO not in df.columns:
-            df[Config.COLUMN_RATIO] = (
-                df[Config.COLUMN_NON_REGULAR] / df[Config.COLUMN_TOTAL] * 100
+        if Config.COLUMN_NON_REGULAR_RATIO not in dataframe.columns:
+            dataframe[Config.COLUMN_NON_REGULAR_RATIO] = (
+                dataframe[Config.COLUMN_NON_REGULAR_EMPLOYEE] /
+                dataframe[Config.COLUMN_TOTAL_EMPLOYEE] * 100
             ).round(1)
 
-        return df
+        return dataframe
 
     @staticmethod
-    def calculate_growth_rate(df: pd.DataFrame, start_year: int,
-                            end_year: int, column: str) -> float:
+    def calculate_employment_growth_rate(
+        dataframe: pd.DataFrame,
+        start_year: int,
+        end_year: int,
+        column_name: str
+    ) -> float:
         """
-        指定期間の成長率を計算
+        指定期間・指定列の成長率をパーセンテージで計算
 
         Args:
-            df: データフレーム
+            dataframe: 雇用データ
             start_year: 開始年
             end_year: 終了年
-            column: 対象列名
+            column_name: 計算対象の列名
 
         Returns:
             float: 成長率（%）
         """
-        start_value = df.loc[df[Config.COLUMN_YEAR] == start_year, column].values[0]
-        end_value = df.loc[df[Config.COLUMN_YEAR] == end_year, column].values[0]
-        return ((end_value / start_value) - 1) * 100
+        start_year_value = dataframe.loc[
+            dataframe[Config.COLUMN_YEAR] == start_year, column_name
+        ].values[0]
+        end_year_value = dataframe.loc[
+            dataframe[Config.COLUMN_YEAR] == end_year, column_name
+        ].values[0]
+        return ((end_year_value / start_year_value) - 1) * 100
 
 
-# ==================== グラフ描画クラス ====================
+# ==================== グラフ描画 ====================
 
-class GraphPlotter:
-    """グラフ描画クラス"""
+class EmploymentGraphPlotter:
+    """
+    雇用形態推移グラフの描画を担当するクラス
+
+    matplotlibを使用してグラフを作成し、PNGファイルとして保存します。
+    """
 
     def __init__(self):
-        """日本語フォントの設定"""
-        self._setup_japanese_font()
+        """日本語フォントを設定してグラフプロッターを初期化"""
+        self._configure_japanese_font()
 
     @staticmethod
-    def _setup_japanese_font() -> None:
-        """日本語フォントの設定"""
+    def _configure_japanese_font() -> None:
+        """matplotlibで日本語を正しく表示できるようフォントを設定"""
         matplotlib.rcParams['font.family'] = 'sans-serif'
         matplotlib.rcParams['font.sans-serif'] = [
             'Noto Sans CJK JP', 'Noto Sans JP', 'IPAexGothic',
             'IPAPGothic', 'Hiragino Sans', 'Yu Gothic', 'DejaVu Sans'
         ]
 
-    def plot(self, df: pd.DataFrame, output_path: str) -> Tuple[plt.Figure, plt.Axes]:
+    def create_and_save_graph(
+        self,
+        dataframe: pd.DataFrame,
+        output_file_path: str
+    ) -> Tuple[plt.Figure, plt.Axes]:
         """
-        雇用形態推移グラフを作成
+        雇用形態推移グラフを作成してファイルに保存
 
         Args:
-            df: データフレーム
-            output_path: 出力ファイルパス
+            dataframe: 雇用データ
+            output_file_path: 保存先ファイルパス
 
         Returns:
             Tuple[plt.Figure, plt.Axes]: 作成されたfigureとaxes
         """
+        figure, axes = plt.subplots(figsize=Config.FIGURE_SIZE)
+
         # データの年範囲を取得
-        min_year = int(df[Config.COLUMN_YEAR].min())
-        max_year = int(df[Config.COLUMN_YEAR].max())
-
-        # 直近期間の開始年を計算
-        recent_period_start = max(min_year, max_year - (Config.RECENT_PERIOD_YEARS - 1))
-
-        # 成長率を計算
-        regular_growth, non_regular_growth = self._calculate_growth_rates(
-            df, recent_period_start, max_year
+        data_min_year = int(dataframe[Config.COLUMN_YEAR].min())
+        data_max_year = int(dataframe[Config.COLUMN_YEAR].max())
+        recent_period_start_year = max(
+            data_min_year,
+            data_max_year - (Config.RECENT_PERIOD_YEARS - 1)
         )
 
-        # グラフ作成
-        fig, ax = plt.subplots(figsize=Config.FIGURE_SIZE)
+        # グラフの各要素を構築
+        self._setup_graph_axes(axes, dataframe)
+        self._draw_employment_trend_lines(axes, dataframe)
 
-        # 各要素を追加
-        self._setup_axes(ax, df)
-        self._plot_lines(ax, df)
+        # データが十分にある場合のみ成長率情報を表示
+        if len(dataframe) >= Config.RECENT_PERIOD_YEARS:
+            regular_growth, non_regular_growth = self._compute_recent_growth_rates(
+                dataframe, recent_period_start_year, data_max_year
+            )
+            self._add_recent_period_reference_line(axes, recent_period_start_year)
+            self._add_growth_rate_display_box(
+                axes, regular_growth, non_regular_growth,
+                recent_period_start_year, data_max_year
+            )
 
-        # データが十分ある場合のみ基準線と成長率ボックスを表示
-        if len(df) >= Config.RECENT_PERIOD_YEARS:
-            self._add_reference_line(ax, recent_period_start)
-            self._add_growth_rate_box(ax, regular_growth, non_regular_growth,
-                                     recent_period_start, max_year)
-
-        self._add_annotations(ax, df)
-        self._add_legend(ax)
-        self._add_source(ax)
+        self._add_latest_value_annotations(axes, dataframe)
+        self._add_graph_legend(axes)
+        self._add_data_source_note(axes)
 
         # レイアウト調整と保存
         plt.tight_layout()
-        plt.savefig(output_path, dpi=Config.DPI, bbox_inches='tight')
-        print(f"グラフを保存しました: {output_path}")
+        plt.savefig(output_file_path, dpi=Config.DPI, bbox_inches='tight')
+        print(f"グラフを保存しました: {output_file_path}")
 
-        return fig, ax
-
-    @staticmethod
-    def _calculate_growth_rates(df: pd.DataFrame, start_year: int,
-                                end_year: int) -> Tuple[float, float]:
-        """成長率を計算"""
-        if len(df) < 2 or start_year >= end_year:
-            return 0.0, 0.0
-
-        regular_growth = EmploymentDataProcessor.calculate_growth_rate(
-            df, start_year, end_year, Config.COLUMN_REGULAR
-        )
-        non_regular_growth = EmploymentDataProcessor.calculate_growth_rate(
-            df, start_year, end_year, Config.COLUMN_NON_REGULAR
-        )
-
-        return regular_growth, non_regular_growth
+        return figure, axes
 
     @staticmethod
-    def _setup_axes(ax: plt.Axes, df: pd.DataFrame) -> None:
-        """軸の設定を行う"""
-        ax.set_xlabel('年', fontsize=Config.FONT_SIZE_LABEL, fontweight='bold')
-        ax.set_ylabel('労働者数（万人）', fontsize=Config.FONT_SIZE_LABEL, fontweight='bold')
-        ax.set_title(
+    def _setup_graph_axes(axes: plt.Axes, dataframe: pd.DataFrame) -> None:
+        """グラフの軸ラベル、タイトル、グリッド、目盛りを設定"""
+        axes.set_xlabel('年', fontsize=Config.FONT_SIZE_AXIS_LABEL, fontweight='bold')
+        axes.set_ylabel('労働者数（万人）', fontsize=Config.FONT_SIZE_AXIS_LABEL, fontweight='bold')
+        axes.set_title(
             'プログラマーの雇用形態推移\n'
             '正社員 vs 非正規雇用（業務委託・契約社員・派遣・アルバイト等）',
             fontsize=Config.FONT_SIZE_TITLE, fontweight='bold', pad=20
         )
-
-        # グリッド設定
-        ax.grid(True, alpha=0.3, linestyle=':', linewidth=1)
-        ax.set_axisbelow(True)
-
-        # X軸設定
-        ax.set_xticks(df[Config.COLUMN_YEAR])
-        ax.set_xticklabels(df[Config.COLUMN_YEAR], rotation=45, fontsize=11)
-
-        # Y軸範囲
-        ax.set_ylim(0, Config.Y_AXIS_MAX)
+        axes.grid(True, alpha=0.3, linestyle=':', linewidth=1)
+        axes.set_axisbelow(True)
+        axes.set_xticks(dataframe[Config.COLUMN_YEAR])
+        axes.set_xticklabels(dataframe[Config.COLUMN_YEAR], rotation=45, fontsize=11)
+        axes.set_ylim(0, Config.Y_AXIS_MAXIMUM_VALUE)
 
     @staticmethod
-    def _plot_lines(ax: plt.Axes, df: pd.DataFrame) -> None:
-        """折れ線グラフを描画"""
-        ax.plot(
-            df[Config.COLUMN_YEAR], df[Config.COLUMN_REGULAR],
+    def _draw_employment_trend_lines(axes: plt.Axes, dataframe: pd.DataFrame) -> None:
+        """正社員と非正規雇用の推移を折れ線グラフで描画"""
+        axes.plot(
+            dataframe[Config.COLUMN_YEAR],
+            dataframe[Config.COLUMN_REGULAR_EMPLOYEE],
             marker='o', linewidth=3.5, markersize=10,
             label='正社員プログラマー',
-            color=Config.COLOR_REGULAR, linestyle='-', zorder=3
+            color=Config.COLOR_REGULAR_EMPLOYEE, linestyle='-', zorder=3
         )
-        ax.plot(
-            df[Config.COLUMN_YEAR], df[Config.COLUMN_NON_REGULAR],
+        axes.plot(
+            dataframe[Config.COLUMN_YEAR],
+            dataframe[Config.COLUMN_NON_REGULAR_EMPLOYEE],
             marker='s', linewidth=3.5, markersize=10,
             label='非正規雇用プログラマー\n（業務委託、契約社員、派遣、アルバイト等）',
-            color=Config.COLOR_NON_REGULAR, linestyle='--', zorder=3
+            color=Config.COLOR_NON_REGULAR_EMPLOYEE, linestyle='--', zorder=3
         )
 
     @staticmethod
-    def _add_reference_line(ax: plt.Axes, recent_period_start: int) -> None:
-        """基準線を追加"""
-        ax.axvline(
-            x=recent_period_start,
-            color='gray', linestyle=':', linewidth=2, alpha=0.5
+    def _compute_recent_growth_rates(
+        dataframe: pd.DataFrame,
+        start_year: int,
+        end_year: int
+    ) -> Tuple[float, float]:
+        """
+        直近期間の正社員・非正規雇用の成長率を計算
+
+        Returns:
+            Tuple[float, float]: (正社員成長率, 非正規雇用成長率)
+        """
+        if len(dataframe) < 2 or start_year >= end_year:
+            return 0.0, 0.0
+
+        return (
+            EmploymentDataProcessor.calculate_employment_growth_rate(
+                dataframe, start_year, end_year, Config.COLUMN_REGULAR_EMPLOYEE
+            ),
+            EmploymentDataProcessor.calculate_employment_growth_rate(
+                dataframe, start_year, end_year, Config.COLUMN_NON_REGULAR_EMPLOYEE
+            )
         )
-        ax.text(
-            recent_period_start, 82, f'← {Config.RECENT_PERIOD_YEARS}年前',
+
+    @staticmethod
+    def _add_recent_period_reference_line(axes: plt.Axes, start_year: int) -> None:
+        """直近期間の開始位置に縦の参照線を追加"""
+        axes.axvline(x=start_year, color='gray', linestyle=':', linewidth=2, alpha=0.5)
+        axes.text(
+            start_year, 82, f'← {Config.RECENT_PERIOD_YEARS}年前',
             fontsize=10, ha='right', color='gray', fontweight='bold'
         )
 
     @staticmethod
-    def _add_growth_rate_box(ax: plt.Axes, regular_growth: float,
-                            non_regular_growth: float, start_year: int,
-                            end_year: int) -> None:
-        """成長率の表示ボックスを追加"""
-        years_diff = end_year - start_year
-        growth_text = (
-            f'【直近{years_diff}年間（{start_year}-{end_year}年）の増加率】\n'
-            f'正社員：+{regular_growth:.1f}%　　'
-            f'非正規雇用：+{non_regular_growth:.1f}%'
-        )
-        ax.text(
-            0.5, 0.96, growth_text,
-            transform=ax.transAxes, fontsize=Config.FONT_SIZE_GROWTH_BOX,
+    def _add_growth_rate_display_box(
+        axes: plt.Axes,
+        regular_employee_growth_rate: float,
+        non_regular_employee_growth_rate: float,
+        start_year: int,
+        end_year: int
+    ) -> None:
+        """成長率情報を表示するボックスをグラフ上部に追加"""
+        axes.text(
+            0.5, 0.96,
+            f'【直近{end_year - start_year}年間（{start_year}-{end_year}年）の増加率】\n'
+            f'正社員：+{regular_employee_growth_rate:.1f}%　　'
+            f'非正規雇用：+{non_regular_employee_growth_rate:.1f}%',
+            transform=axes.transAxes,
+            fontsize=Config.FONT_SIZE_GROWTH_RATE_BOX,
             fontweight='bold', ha='center', va='top',
             bbox=dict(
                 boxstyle='round,pad=0.8',
@@ -374,55 +420,47 @@ class GraphPlotter:
         )
 
     @staticmethod
-    def _add_annotations(ax: plt.Axes, df: pd.DataFrame) -> None:
-        """最新値の注釈を追加"""
-        latest = df.iloc[-1]
+    def _add_latest_value_annotations(axes: plt.Axes, dataframe: pd.DataFrame) -> None:
+        """最新年のデータポイントに値を示す注釈を追加"""
+        latest_row = dataframe.iloc[-1]
 
-        annotations = [
-            {
-                'value': latest[Config.COLUMN_REGULAR],
-                'column': Config.COLUMN_REGULAR,
-                'color': Config.COLOR_REGULAR,
-                'offset': (10, 10)
-            },
-            {
-                'value': latest[Config.COLUMN_NON_REGULAR],
-                'column': Config.COLUMN_NON_REGULAR,
-                'color': Config.COLOR_NON_REGULAR,
-                'offset': (10, -25)
-            }
-        ]
-
-        for anno in annotations:
-            ax.annotate(
-                f'{anno["value"]:.0f}万人',
-                xy=(latest[Config.COLUMN_YEAR], anno['value']),
-                xytext=anno['offset'], textcoords='offset points',
-                fontsize=Config.FONT_SIZE_ANNOTATION, fontweight='bold',
-                color=anno['color'],
+        for column_name, color, y_offset in [
+            (Config.COLUMN_REGULAR_EMPLOYEE, Config.COLOR_REGULAR_EMPLOYEE, 10),
+            (Config.COLUMN_NON_REGULAR_EMPLOYEE, Config.COLOR_NON_REGULAR_EMPLOYEE, -25)
+        ]:
+            axes.annotate(
+                f'{latest_row[column_name]:.0f}万人',
+                xy=(latest_row[Config.COLUMN_YEAR], latest_row[column_name]),
+                xytext=(10, y_offset), textcoords='offset points',
+                fontsize=Config.FONT_SIZE_VALUE_ANNOTATION,
+                fontweight='bold', color=color,
                 bbox=dict(
                     boxstyle='round,pad=0.5',
                     facecolor='white',
-                    edgecolor=anno['color'],
+                    edgecolor=color,
                     linewidth=2
                 ),
-                arrowprops=dict(arrowstyle='->', color=anno['color'], lw=2)
+                arrowprops=dict(arrowstyle='->', color=color, lw=2)
             )
 
     @staticmethod
-    def _add_legend(ax: plt.Axes) -> None:
-        """凡例を追加"""
-        ax.legend(
-            fontsize=Config.FONT_SIZE_LEGEND, loc='upper left',
-            framealpha=0.95, edgecolor='black', fancybox=True
+    def _add_graph_legend(axes: plt.Axes) -> None:
+        """グラフに凡例を追加"""
+        axes.legend(
+            fontsize=Config.FONT_SIZE_LEGEND,
+            loc='upper left',
+            framealpha=0.95,
+            edgecolor='black',
+            fancybox=True
         )
 
     @staticmethod
-    def _add_source(ax: plt.Axes) -> None:
-        """出典を追加"""
-        ax.text(
-            0.02, 0.02, Config.SOURCE_TEXT,
-            transform=ax.transAxes, fontsize=Config.FONT_SIZE_SOURCE,
+    def _add_data_source_note(axes: plt.Axes) -> None:
+        """グラフ左下にデータ出典情報を追加"""
+        axes.text(
+            0.02, 0.02, Config.DATA_SOURCE_TEXT,
+            transform=axes.transAxes,
+            fontsize=Config.FONT_SIZE_DATA_SOURCE,
             va='bottom', ha='left', style='italic', color='#555555',
             bbox=dict(
                 boxstyle='round,pad=0.5',
@@ -433,104 +471,99 @@ class GraphPlotter:
         )
 
 
-# ==================== 統計情報出力クラス ====================
+# ==================== 統計情報表示 ====================
 
-class StatisticsPrinter:
-    """統計情報出力クラス"""
+class EmploymentStatisticsPrinter:
+    """
+    雇用統計サマリーをコンソールに出力するクラス
+
+    最新年の状況、成長率、年次データをテーブル形式で表示します。
+    """
 
     @staticmethod
-    def print_summary(df: pd.DataFrame) -> None:
+    def display_employment_summary(dataframe: pd.DataFrame) -> None:
         """
-        統計サマリーを出力
+        統計サマリー全体をコンソールに出力
 
         Args:
-            df: データフレーム
+            dataframe: 雇用データ
         """
-        print("\n" + "=" * Config.SEPARATOR_LENGTH)
+        print("\n" + "=" * Config.SEPARATOR_LINE_LENGTH)
         print("プログラマー雇用形態統計サマリー")
-        print("=" * Config.SEPARATOR_LENGTH)
+        print("=" * Config.SEPARATOR_LINE_LENGTH)
 
-        StatisticsPrinter._print_latest_data(df)
-        StatisticsPrinter._print_growth_rates(df)
-        StatisticsPrinter._print_yearly_data(df)
+        EmploymentStatisticsPrinter._display_latest_year_statistics(dataframe)
+        EmploymentStatisticsPrinter._display_growth_rate_statistics(dataframe)
+        EmploymentStatisticsPrinter._display_yearly_data_table(dataframe)
 
-        print("\n" + "=" * Config.SEPARATOR_LENGTH)
+        print("\n" + "=" * Config.SEPARATOR_LINE_LENGTH)
 
     @staticmethod
-    def _print_latest_data(df: pd.DataFrame) -> None:
-        """最新年のデータを出力"""
-        latest_year = int(df[Config.COLUMN_YEAR].max())
-        latest = df[df[Config.COLUMN_YEAR] == latest_year].iloc[0]
+    def _display_latest_year_statistics(dataframe: pd.DataFrame) -> None:
+        """最新年のデータ（人数・比率・内訳）を表示"""
+        latest_year = int(dataframe[Config.COLUMN_YEAR].max())
+        latest_data = dataframe[dataframe[Config.COLUMN_YEAR] == latest_year].iloc[0]
 
         print(f"\n【{latest_year}年の状況】")
-        print(f"正社員: {latest[Config.COLUMN_REGULAR]:.0f}万人 "
-              f"({100 - latest[Config.COLUMN_RATIO]:.1f}%)")
-        print(f"非正規雇用: {latest[Config.COLUMN_NON_REGULAR]:.0f}万人 "
-              f"({latest[Config.COLUMN_RATIO]:.1f}%)")
+        print(f"正社員: {latest_data[Config.COLUMN_REGULAR_EMPLOYEE]:.0f}万人 "
+              f"({100 - latest_data[Config.COLUMN_NON_REGULAR_RATIO]:.1f}%)")
+        print(f"非正規雇用: {latest_data[Config.COLUMN_NON_REGULAR_EMPLOYEE]:.0f}万人 "
+              f"({latest_data[Config.COLUMN_NON_REGULAR_RATIO]:.1f}%)")
 
-        # 内訳（詳細データがある場合のみ表示）
-        for col in Config.DETAIL_COLUMNS:
-            if col in latest.index:
-                display_name = col.split('（')[0]  # カッコ前の部分を表示名として使用
-                print(f"  - {display_name}: {latest[col]:.0f}万人")
+        # 非正規雇用の内訳を表示（データが存在する場合のみ）
+        for breakdown_column in Config.NON_REGULAR_BREAKDOWN_COLUMNS:
+            if breakdown_column in latest_data.index:
+                display_label = breakdown_column.split('（')[0]
+                print(f"  - {display_label}: {latest_data[breakdown_column]:.0f}万人")
 
-        print(f"合計: {latest[Config.COLUMN_TOTAL]:.0f}万人")
+        print(f"合計: {latest_data[Config.COLUMN_TOTAL_EMPLOYEE]:.0f}万人")
 
     @staticmethod
-    def _print_growth_rates(df: pd.DataFrame) -> None:
-        """成長率を出力"""
-        if len(df) < 2:
+    def _display_growth_rate_statistics(dataframe: pd.DataFrame) -> None:
+        """全期間および直近期間の成長率を表示"""
+        if len(dataframe) < 2:
             return
 
         print(f"\n【期間別増加率】")
 
-        min_year = int(df[Config.COLUMN_YEAR].min())
-        max_year = int(df[Config.COLUMN_YEAR].max())
+        data_min_year = int(dataframe[Config.COLUMN_YEAR].min())
+        data_max_year = int(dataframe[Config.COLUMN_YEAR].max())
 
-        # 全期間
-        total_regular = EmploymentDataProcessor.calculate_growth_rate(
-            df, min_year, max_year, Config.COLUMN_REGULAR
-        )
-        total_non_regular = EmploymentDataProcessor.calculate_growth_rate(
-            df, min_year, max_year, Config.COLUMN_NON_REGULAR
-        )
-        print(f"全期間（{min_year}-{max_year}年）:")
-        print(f"  正社員: +{total_regular:.1f}%")
-        print(f"  非正規雇用: +{total_non_regular:.1f}%")
+        # 全期間の成長率
+        print(f"全期間（{data_min_year}-{data_max_year}年）:")
+        print(f"  正社員: +{EmploymentDataProcessor.calculate_employment_growth_rate(dataframe, data_min_year, data_max_year, Config.COLUMN_REGULAR_EMPLOYEE):.1f}%")
+        print(f"  非正規雇用: +{EmploymentDataProcessor.calculate_employment_growth_rate(dataframe, data_min_year, data_max_year, Config.COLUMN_NON_REGULAR_EMPLOYEE):.1f}%")
 
-        # 直近期間（データが十分ある場合のみ）
-        if len(df) >= Config.RECENT_PERIOD_YEARS:
-            recent_period_start = max(min_year, max_year - (Config.RECENT_PERIOD_YEARS - 1))
-            recent_regular = EmploymentDataProcessor.calculate_growth_rate(
-                df, recent_period_start, max_year, Config.COLUMN_REGULAR
-            )
-            recent_non_regular = EmploymentDataProcessor.calculate_growth_rate(
-                df, recent_period_start, max_year, Config.COLUMN_NON_REGULAR
-            )
-            years_diff = max_year - recent_period_start
-            print(f"\n直近{years_diff}年間（{recent_period_start}-{max_year}年）:")
-            print(f"  正社員: +{recent_regular:.1f}%")
-            print(f"  非正規雇用: +{recent_non_regular:.1f}%")
+        # 直近期間の成長率（データが十分ある場合のみ）
+        if len(dataframe) >= Config.RECENT_PERIOD_YEARS:
+            recent_start_year = max(data_min_year, data_max_year - (Config.RECENT_PERIOD_YEARS - 1))
+            print(f"\n直近{data_max_year - recent_start_year}年間（{recent_start_year}-{data_max_year}年）:")
+            print(f"  正社員: +{EmploymentDataProcessor.calculate_employment_growth_rate(dataframe, recent_start_year, data_max_year, Config.COLUMN_REGULAR_EMPLOYEE):.1f}%")
+            print(f"  非正規雇用: +{EmploymentDataProcessor.calculate_employment_growth_rate(dataframe, recent_start_year, data_max_year, Config.COLUMN_NON_REGULAR_EMPLOYEE):.1f}%")
 
     @staticmethod
-    def _print_yearly_data(df: pd.DataFrame) -> None:
-        """年次データを出力"""
+    def _display_yearly_data_table(dataframe: pd.DataFrame) -> None:
+        """年次データをテーブル形式で表示"""
         print(f"\n【年次データ（抜粋）】")
-        display_df = df[[
+        print(dataframe[[
             Config.COLUMN_YEAR,
-            Config.COLUMN_REGULAR,
-            Config.COLUMN_NON_REGULAR,
-            Config.COLUMN_TOTAL,
-            Config.COLUMN_RATIO
-        ]].copy()
-        print(display_df.to_string(index=False))
+            Config.COLUMN_REGULAR_EMPLOYEE,
+            Config.COLUMN_NON_REGULAR_EMPLOYEE,
+            Config.COLUMN_TOTAL_EMPLOYEE,
+            Config.COLUMN_NON_REGULAR_RATIO
+        ]].to_string(index=False))
 
 
 # ==================== コマンドライン処理 ====================
 
-def parse_arguments() -> argparse.Namespace:
-    """コマンドライン引数をパース"""
-    parser = argparse.ArgumentParser(
+def parse_command_line_arguments() -> argparse.Namespace:
+    """
+    コマンドライン引数を解析
+
+    Returns:
+        argparse.Namespace: 解析された引数
+    """
+    argument_parser = argparse.ArgumentParser(
         description='プログラマー雇用形態推移グラフ作成プログラム',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -540,9 +573,6 @@ def parse_arguments() -> argparse.Namespace:
 
   # CSVファイルから実データを読み込む
   python3 programmer_employment_graph.py --input data_source.csv
-
-  # カレントディレクトリの data_source.csv を自動検出
-  python3 programmer_employment_graph.py
 
 CSVファイルフォーマット:
   必須列: 年, 正社員, 非正規雇用
@@ -560,55 +590,65 @@ CSVファイルフォーマット:
         """
     )
 
-    parser.add_argument(
+    argument_parser.add_argument(
         '-i', '--input',
         type=str,
-        help=f'入力CSVファイルのパス（指定しない場合、{Config.DEFAULT_INPUT_FILE}を探し、なければサンプルデータを使用）'
+        help=f'入力CSVファイルのパス（指定しない場合、{Config.DEFAULT_INPUT_FILENAME}を自動検出）'
     )
 
-    parser.add_argument(
+    argument_parser.add_argument(
         '-o', '--output',
         type=str,
-        default=Config.DEFAULT_OUTPUT_FILE,
-        help=f'出力画像ファイル名（デフォルト: {Config.DEFAULT_OUTPUT_FILE}）'
+        default=Config.DEFAULT_OUTPUT_GRAPH_FILENAME,
+        help=f'出力画像ファイル名（デフォルト: {Config.DEFAULT_OUTPUT_GRAPH_FILENAME}）'
     )
 
-    return parser.parse_args()
+    return argument_parser.parse_args()
 
 
-def main() -> None:
-    """メイン処理"""
-    args = parse_arguments()
+def execute_main_program() -> None:
+    """
+    プログラムのメイン実行フロー
 
-    # 入力ファイルの決定
-    input_csv = args.input
-    if not input_csv and os.path.exists(Config.DEFAULT_INPUT_FILE):
-        input_csv = Config.DEFAULT_INPUT_FILE
-        print(f"\n{Config.DEFAULT_INPUT_FILE} を検出しました。実データとして使用します。\n")
+    1. コマンドライン引数を解析
+    2. データを読み込みまたは生成
+    3. グラフを作成して保存
+    4. 統計サマリーを表示
+    5. 結果をCSVファイルに保存
+    """
+    command_line_args = parse_command_line_arguments()
 
-    # データ作成
+    # 入力CSVファイルの決定（指定がなければ自動検出を試みる）
+    input_csv_path = command_line_args.input
+    if not input_csv_path and os.path.exists(Config.DEFAULT_INPUT_FILENAME):
+        input_csv_path = Config.DEFAULT_INPUT_FILENAME
+        print(f"\n{Config.DEFAULT_INPUT_FILENAME} を検出しました。実データとして使用します。\n")
+
+    # データ読み込みまたはサンプルデータ生成
     try:
-        df = EmploymentDataProcessor.create_dataframe(csv_path=input_csv)
-    except (FileNotFoundError, ValueError) as e:
-        print(f"エラー: {e}", file=sys.stderr)
+        employment_dataframe = EmploymentDataProcessor.load_or_create_dataframe(input_csv_path)
+    except (FileNotFoundError, ValueError) as error:
+        print(f"エラー: {error}", file=sys.stderr)
         print("サンプルデータの使用を続けるには、引数なしで実行してください。", file=sys.stderr)
         sys.exit(1)
 
-    # グラフ作成
-    plotter = GraphPlotter()
-    output_path = args.output
-    fig, ax = plotter.plot(df, output_path)
+    # グラフ作成と保存
+    graph_plotter = EmploymentGraphPlotter()
+    graph_plotter.create_and_save_graph(employment_dataframe, command_line_args.output)
 
-    # 統計情報表示
-    StatisticsPrinter.print_summary(df)
+    # 統計サマリー表示
+    EmploymentStatisticsPrinter.display_employment_summary(employment_dataframe)
 
-    # CSVとして保存
-    csv_output = Config.DEFAULT_CSV_OUTPUT
-    df.to_csv(csv_output, index=False, encoding='utf-8-sig')
-    print(f"\nデータをCSVに保存しました: {csv_output}")
+    # データをCSVファイルに保存
+    employment_dataframe.to_csv(
+        Config.DEFAULT_OUTPUT_CSV_FILENAME,
+        index=False,
+        encoding='utf-8-sig'
+    )
+    print(f"\nデータをCSVに保存しました: {Config.DEFAULT_OUTPUT_CSV_FILENAME}")
 
     plt.close()
 
 
 if __name__ == '__main__':
-    main()
+    execute_main_program()
